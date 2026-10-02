@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cassert>
 #include <cstring>
+#include <chrono>
 #include <type_traits>
 
 #include "../ring_buffer.h"
@@ -21,17 +22,43 @@
     #define FORCE_INLINE inline
 #endif
 
+constexpr size_t ReadCycles {65536};
+constexpr size_t WriteCycles {256};
+
 enum Operation {READ, WRITE};
 
-template<typename T>
-FORCE_INLINE void _write(uint8_t* buffer, size_t capacity, size_t cycles, bool ring)
+class ScopedTimer final
 {
-    if (ring)
+public:
+    explicit ScopedTimer(const char* name = nullptr)
+        : m_name(name)
+    {
+        m_beg = std::chrono::high_resolution_clock::now();
+    }
+
+    ~ScopedTimer()
+    {
+        const auto end = std::chrono::high_resolution_clock::now();
+        const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(end - m_beg);
+        const auto elapsedUs = std::chrono::duration_cast<std::chrono::microseconds>(end - m_beg);
+        printf("[%s] Execution time: %ld ms (%ld µs)\n", m_name, elapsedMs.count(), elapsedUs.count());
+    }
+
+private:
+    const char* m_name {nullptr};
+    std::chrono::high_resolution_clock::time_point m_beg {};
+};
+
+template<typename T>
+FORCE_INLINE void _write(uint8_t* buffer, size_t capacity, size_t cycles, bool copy)
+{
+    if (copy)
     {
         for (size_t i = 0; i < cycles*capacity; ++i)
         {
             auto sample = reinterpret_cast<T*>(&buffer[(i % capacity)*sizeof(T)]);
             memset(sample, i % capacity, sizeof(T));
+            memcpy(&buffer[(((i % capacity)) + capacity)*sizeof(T)], sample, sizeof(T));
         }
     }
     else
@@ -40,7 +67,6 @@ FORCE_INLINE void _write(uint8_t* buffer, size_t capacity, size_t cycles, bool r
         {
             auto sample = reinterpret_cast<T*>(&buffer[(i % capacity)*sizeof(T)]);
             memset(sample, i % capacity, sizeof(T));
-            memcpy(&buffer[(((i % capacity)) + capacity)*sizeof(T)], sample, sizeof(T));
         }
     }
 }
@@ -57,7 +83,7 @@ FORCE_INLINE void _read(const uint8_t* buffer, size_t capacity, size_t cycles)
 }
 
 template<typename T>
-int mallocTest(size_t capacity, int op)
+int mallocTest(size_t capacity, int op, bool warmup)
 {
     volatile auto buffer = reinterpret_cast<uint8_t*>(malloc(2*capacity*sizeof(T)));
     if (nullptr == buffer)
@@ -66,14 +92,22 @@ int mallocTest(size_t capacity, int op)
         return 1;
     }
 
+    {
+        volatile auto stub = RingAllocator(capacity*sizeof(T)); // Для уравнивания метрик
+    }
+
     if (WRITE == op)
     {
-        _write<T>(buffer, capacity, 16, false);
+        // auto _ = ScopedTimer("write");
+        _write<T>(buffer, capacity, WriteCycles, true);
     }
     else if (READ == op)
     {
-        _write<T>(buffer, capacity, 1, false); // прогреть кэши
-        _read<T>(buffer, capacity, 64);
+        if (warmup)
+            _write<T>(buffer, capacity, 1, false); // прогреть кэши
+
+        // auto _ = ScopedTimer("read");
+        _read<T>(buffer, capacity, ReadCycles);
     }
     free(buffer);
 
@@ -81,7 +115,7 @@ int mallocTest(size_t capacity, int op)
 }
 
 template<typename T>
-int mmapTest(size_t capacity, int op)
+int mmapTest(size_t capacity, int op, bool warmup)
 {
 #if defined(__linux__)
 
@@ -97,14 +131,22 @@ int mmapTest(size_t capacity, int op)
         return 1;
     }
 
+    {
+        volatile auto stub = RingAllocator(capacity*sizeof(T)); // Для уравнивания метрик
+    }
+
     if (WRITE == op)
     {
-        _write<T>(buffer, capacity, 16, false);
+        // auto _ = ScopedTimer("write");
+        _write<T>(buffer, capacity, WriteCycles, true);
     }
     else if (READ == op)
     {
-        _write<T>(buffer, capacity, 1, false); // прогреть кэши
-        _read<T>(buffer, capacity, 64);
+        if (warmup)
+            _write<T>(buffer, capacity, 1, false); // прогреть кэши
+
+        // auto _ = ScopedTimer("read");
+        _read<T>(buffer, capacity, ReadCycles);
     }
 
     munmap(buffer, 2*capacity*sizeof(T));
@@ -119,19 +161,28 @@ int mmapTest(size_t capacity, int op)
 }
 
 template<typename T>
-int ringTest(size_t capacity, int op)
+int ringTest(size_t capacity, int op, bool warmup)
 {
     auto m = RingAllocator(capacity*sizeof(T));
     volatile auto buffer = reinterpret_cast<uint8_t*>(m.left());
 
+    {
+        volatile auto stub = reinterpret_cast<uint8_t*>(malloc(2*capacity*sizeof(T))); // Для уравнивания метрик
+        free(stub);
+    }
+
     if (WRITE == op)
     {
-        _write<T>(buffer, capacity, 16, true);
+        // auto _ = ScopedTimer("write");
+        _write<T>(buffer, capacity, WriteCycles, false);
     }
     else if (READ == op)
     {
-        _write<T>(buffer, capacity, 1, true); // прогреть кэши
-        _read<T>(buffer, capacity, 64);
+        if (warmup)
+            _write<T>(buffer, capacity, 1, false); // прогреть кэши
+
+        // auto _ = ScopedTimer("read");
+        _read<T>(buffer, capacity, ReadCycles);
     }
 
     return 0;
@@ -149,27 +200,28 @@ int main(int argc, char* argv[])
     assert(0 == (sizeof(Sample640)  % getPageSize()) && "Page alignment violated");
     assert(0 == (sizeof(Sample1280) % getPageSize()) && "Page alignment violated");
 
-    typedef int (*testFun)(size_t, int);
-    static testFun mallocTests[3] = {mallocTest<Sample320>, mallocTest<Sample640>, mallocTest<Sample1280>};
-    static testFun mmapTests[3]   = {mmapTest<Sample320>, mmapTest<Sample640>, mmapTest<Sample1280>};
-    static testFun ringTests[3]   = {ringTest<Sample320>, ringTest<Sample640>, ringTest<Sample1280>};
+    typedef int (*TestFun)(size_t, int, bool);
+    static TestFun mallocTests[3] = {mallocTest<Sample320>, mallocTest<Sample640>, mallocTest<Sample1280>};
+    static TestFun mmapTests[3]   = {mmapTest<Sample320>, mmapTest<Sample640>, mmapTest<Sample1280>};
+    static TestFun ringTests[3]   = {ringTest<Sample320>, ringTest<Sample640>, ringTest<Sample1280>};
 
     const std::string type   = (argc > 1) ? std::string(argv[1]) : std::string("ring");
     const int         oper   = (argc > 2) ? ("write" == std::string(argv[2])) : 0;
     const size_t      volume = (argc > 3) ? std::stoul(argv[3])  : 0;
+    const bool        warmup = (argc > 4) ? std::stoul(argv[4])  : 0;
 
     volatile int stub = 0;
     if (type == "malloc")
     {
-        stub = mallocTests[volume](48, oper);
+        stub = mallocTests[volume](48, oper, warmup);
     }
     else if (type == "mmap")
     {
-        stub = mmapTests[volume](48, oper);
+        stub = mmapTests[volume](48, oper, warmup);
     }
     else if (type == "ring")
     {
-        stub = ringTests[volume](48, oper);
+        stub = ringTests[volume](48, oper, warmup);
     }
     else
     {

@@ -54,6 +54,8 @@
 
 Профилирование по системных счетчикам
 
+    sudo sysctl -w kernel.perf_event_paranoid=1
+
     perf stat --repeat=32 -dd ./perf_tests ring read 1
 
     argv[1] - тип теста    : malloc, mmap, ring
