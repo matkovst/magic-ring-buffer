@@ -19,7 +19,6 @@
     #include <linux/version.h>
 #elif defined(_WIN32)
     #include <windows.h>
-    #pragma comment(lib, "onecore.lib") // Для VirtualAlloc2
 #elif defined(__APPLE__) && defined(__MACH__)
     #error "No implementation for Apple"
 #endif
@@ -185,6 +184,40 @@ int memfd_create(const char* name, unsigned int flags)
 #endif // #if defined(__linux__)
 
 #if defined(_WIN32)
+
+typedef PVOID(WINAPI *PFN_VirtualAlloc2)(
+    HANDLE Process,
+    PVOID BaseAddress,
+    SIZE_T Size,
+    ULONG AllocationType,
+    ULONG PageProtection,
+    MEM_EXTENDED_PARAMETER *ExtendedParameters,
+    ULONG ParameterCount
+);
+
+typedef PVOID(WINAPI *PFN_MapViewOfFile3)(
+    HANDLE FileMapping,
+    HANDLE Process,
+    PVOID BaseAddress,
+    ULONG64 Offset,
+    SIZE_T ViewSize,
+    ULONG AllocationType,
+    ULONG PageProtection,
+    MEM_EXTENDED_PARAMETER *ExtendedParameters,
+    ULONG ParameterCount
+);
+
+PFN_VirtualAlloc2 getVirtualAlloc2(void) {
+    HMODULE hMod = GetModuleHandleA("kernelbase.dll");
+    if (!hMod) return NULL;
+    return (PFN_VirtualAlloc2)GetProcAddress(hMod, "VirtualAlloc2");
+}
+
+PFN_MapViewOfFile3 getMapViewOfFile3(void) {
+    HMODULE hMod = GetModuleHandleA("kernelbase.dll");
+    if (!hMod) return NULL;
+    return (PFN_MapViewOfFile3)GetProcAddress(hMod, "MapViewOfFile3");
+}
 
 static size_t getGranularity()
 {
@@ -374,8 +407,15 @@ public:
 
     #elif defined(_WIN32)
 
+        PFN_VirtualAlloc2 pVirtualAlloc2 = getVirtualAlloc2();
+        PFN_MapViewOfFile3 pMapViewOfFile3 = getMapViewOfFile3();
+        if (nullptr == pVirtualAlloc2 || nullptr == pMapViewOfFile3)
+        {
+            throw std::runtime_error(syscallFailureMessage("Failed to get sys funcs"));
+        }
+
         // Застолбить виртуальную область под будущее разбиение на 2 блока
-        m_base = VirtualAlloc2(
+        m_base = pVirtualAlloc2(
             NULL, // Текущий процесс
             NULL, // Дать системе подобрать адрес, выровненный по granularity
             m_size << 1, // Объем
@@ -417,22 +457,22 @@ public:
         };
 
         HANDLE fileDesc = CreateFileMappingW(
-            INVALID_HANDLE_VALUE,   // Файл подкачки
-            NULL,                   // Защита по умолчанию
-            PAGE_READWRITE,         // Доступ на чтение/запись
-            0, m_size,              // Размер
+            INVALID_HANDLE_VALUE,           // Файл подкачки
+            NULL,                           // Защита по умолчанию
+            PAGE_READWRITE,                 // Доступ на чтение/запись
+            0, static_cast<DWORD>(m_size),  // Размер
             NULL);
         ScopedHandle fileDescRaii {fileDesc};
 
         // Расположить виртуальные блоки по заданному адресу, 
         // привязать физическую область памяти
 
-        m_leftPage = MapViewOfFile3(
+        m_leftPage = pMapViewOfFile3(
             fileDesc, NULL,                                     // Файл подкачки, текущий процесс
             m_base, 0, m_size,                                  // Адрес и размер блока
             MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0    // Заполнить подложку, отобразить блок в файл подкачки
             );
-        m_rightPage = MapViewOfFile3(
+        m_rightPage = pMapViewOfFile3(
             fileDesc, NULL,                                                 // Файл подкачки, текущий процесс
             (void*)(reinterpret_cast<char*>(m_base) + m_size), 0, m_size,   // Адрес и размер блока
             MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, NULL, 0                // Заполнить подложку, отобразить блок в файл подкачки
